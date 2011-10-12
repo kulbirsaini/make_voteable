@@ -141,29 +141,37 @@ module MakeVoteable
     # Returns true if the voter voted for the +voteable+.
     def voted?(voteable)
       check_voteable(voteable)
-      voting = fetch_voting(voteable)
-      !voting.nil?
+      Voting.where(
+        :voter_id => self.id,
+        :voter_type => self.class.name,
+        :voteable_id => voteable.id,
+        :voteable_type => voteable.class.name
+      ).exists?
     end
 
     # Returns true if the voter up voted the +voteable+.
     def up_voted?(voteable)
-      check_voteable(voteable)
-      voting = fetch_voting(voteable)
-      return false if voting.nil?
-      return true if voting.has_attribute?(:up_vote) && voting.up_vote
-      false
+      voted_which_way?(voteable, :up)
     end
 
     # Returns true if the voter down voted the +voteable+.
     def down_voted?(voteable)
-      check_voteable(voteable)
-      voting = fetch_voting(voteable)
-      return false if voting.nil?
-      return true if voting.has_attribute?(:up_vote) && !voting.up_vote
-      false
+      voted_which_way?(voteable, :down)
     end
 
     private
+
+    def voted_which_way?(voteable, direction)
+      raise ArgumentError, "expected :up or :down" unless [:up, :down].include?(direction)
+      check_voteable(voteable)
+      Voting.where(
+        :voter_id => self.id,
+        :voter_type => self.class.name,
+        :up_vote => direction == :up ? true : false,
+        :voteable_id => voteable.id,
+        :voteable_type => voteable.class.name
+      ).exists?
+    end
 
     def fetch_voting(voteable)
       Voting.where(
