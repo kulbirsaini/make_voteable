@@ -10,6 +10,112 @@ module MakeVoteable
       def voteable?
         true
       end
+
+      # The point of this function is to return rankings based on the difference between up and down votes
+      # assuming equal weighting (i.e. a user with 1 up vote and 1 down vote has a Vote_Total of 0.
+      # First the votes table is joined twiced so that the Vote_Total can be calculated for every ID
+      # Then this table is joined against the specific table passed to this function to allow for
+      # ranking of the items within that table based on the difference between up and down votes.
+      # Options:
+      #  :start_at            - Restrict the votes to those created after a certain time
+      #  :end_at              - Restrict the votes to those created before a certain time
+      #  :ascending           - Default false - normal order DESC (i.e. highest rank to lowest)
+      #  :at_least            - Default 1 - Item must have at least X votes
+      #  :at_most             - Item may not have more than X votes
+      def plusminus_tally(*args)
+        options = args.extract_options!
+
+        tsub0 = Voting
+        tsub0 = tsub0.where("up_vote = ?", false)
+        tsub0 = tsub0.where("voteable_type = ?", self.name)
+        tsub0 = tsub0.group("voteable_id")
+        tsub0 = tsub0.select("DISTINCT voteable_id, COUNT(up_vote) as votes_against")
+
+        tsub1 = Voting
+        tsub1 = tsub1.where("up_vote = ?", true)
+        tsub1 = tsub1.where("voteable_type = ?", self.name)
+        tsub1 = tsub1.group("voteable_id")
+        tsub1 = tsub1.select("DISTINCT voteable_id, COUNT(up_vote) as votes_for")
+
+        t = self.joins("LEFT OUTER JOIN (SELECT DISTINCT #{Voting.table_name}.*,
+            (COALESCE(vfor.votes_for, 0)-COALESCE(against.votes_against, 0)) AS vote_total
+            FROM (#{Voting.table_name} LEFT JOIN
+            (#{tsub0.to_sql}) AS against ON #{Voting.table_name}.voteable_id = against.voteable_id)
+            LEFT JOIN
+            (#{tsub1.to_sql}) as vfor ON #{Voting.table_name}.voteable_id = vfor.voteable_id)
+            AS joined_#{Voting.table_name} ON #{self.table_name}.#{self.primary_key} =
+            joined_#{Voting.table_name}.voteable_id")
+
+            t = t.where("joined_#{Voting.table_name}.voteable_type = '#{self.name}'")
+            t = t.group("joined_#{Voting.table_name}.voteable_id, joined_#{Voting.table_name}.vote_total, #{column_names_for_tally}")
+            t = t.where("joined_#{Voting.table_name}.created_at >= ?", options[:start_at]) if options[:start_at]
+            t = t.where("joined_#{Voting.table_name}.created_at <= ?", options[:end_at]) if options[:end_at]
+            t = options[:ascending] ? t.order("joined_#{Voting.table_name}.vote_total") : t.order("joined_#{Voting.table_name}.vote_total DESC")
+
+            t = t.having([
+                  "COUNT(joined_#{Voting.table_name}.voteable_id) > 0",
+                  (options[:at_least] ?
+                    "joined_#{Voting.table_name}.vote_total >= #{sanitize(options[:at_least])}" : nil
+                  ),
+                  (options[:at_most] ?
+                    "joined_#{Voting.table_name}.vote_total <= #{sanitize(options[:at_most])}" : nil
+                  )
+                ].compact.join(' AND '))
+
+            t.select("#{self.table_name}.*, joined_#{Voting.table_name}.vote_total")
+      end
+
+      # #rank_tally is depreciated.
+      alias_method :rank_tally, :plusminus_tally
+
+      # Calculate the vote counts for all voteables of my type.
+      # This method returns all voteables with at least one vote.
+      # The vote count for each voteable is available as #vote_count.
+      #
+      # Options:
+      #  :start_at    - Restrict the votes to those created after a certain time
+      #  :end_at      - Restrict the votes to those created before a certain time
+      #  :conditions  - A piece of SQL conditions to add to the query
+      #  :limit       - The maximum number of voteables to return
+      #  :order       - A piece of SQL to order by. Eg 'vote_count DESC' or 'voteable.created_at DESC'
+      #  :at_least    - Item must have at least X votes
+      #  :at_most     - Item may not have more than X votes
+      def tally(*args)
+        options = args.extract_options!
+
+        # Use the explicit SQL statement throughout for Postgresql compatibility.
+        vote_count = "COUNT(#{Voting.table_name}.voteable_id)"
+
+        t = self.where("#{Voting.table_name}.voteable_type = '#{self.name}'")
+
+        # We join so that you can order by columns on the voteable model.
+        t = t.joins("LEFT OUTER JOIN #{Voting.table_name} ON #{self.table_name}.#{self.primary_key} = #{Voting.table_name}.voteable_id")
+
+        t = t.group("#{Voting.table_name}.voteable_id, #{column_names_for_tally}")
+        t = t.limit(options[:limit]) if options[:limit]
+        t = t.where("#{Voting.table_name}.created_at >= ?", options[:start_at]) if options[:start_at]
+        t = t.where("#{Voting.table_name}.created_at <= ?", options[:end_at]) if options[:end_at]
+        t = t.where(options[:conditions]) if options[:conditions]
+        t = options[:order] ? t.order(options[:order]) : t.order("#{vote_count} DESC")
+
+        # I haven't been able to confirm this bug yet, but Arel (2.0.7) currently blows up
+        # with multiple 'having' clauses. So we hack them all into one for now.
+        # If you have a more elegant solution, a pull request on Github would be greatly appreciated.
+        t = t.having([
+            "#{vote_count} > 0",
+            (options[:at_least] ? "#{vote_count} >= #{sanitize(options[:at_least])}" : nil),
+            (options[:at_most] ? "#{vote_count} <= #{sanitize(options[:at_most])}" : nil)
+            ].compact.join(' AND '))
+        # t = t.having("#{vote_count} > 0")
+        # t = t.having(["#{vote_count} >= ?", options[:at_least]]) if options[:at_least]
+        # t = t.having(["#{vote_count} <= ?", options[:at_most]]) if options[:at_most]
+        t.select("#{self.table_name}.*, COUNT(#{Voting.table_name}.voteable_id) AS vote_count")
+      end
+
+      def column_names_for_tally
+        column_names.map { |column| "#{self.table_name}.#{column}" }.join(', ')
+      end
+
     end
 
     # Return the difference of down and up votes.
